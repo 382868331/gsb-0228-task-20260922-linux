@@ -15,10 +15,12 @@ from typing import Optional, Sequence
 
 __all__ = [
     "MAX_TENSORS",
+    "MAX_SLICES",
     "TensorSpec",
     "OperandRef",
     "ContractStep",
     "ContractionPlan",
+    "SlicedPlan",
     "FrontPoint",
     "TensorPlanningError",
     "InvalidProblemError",
@@ -27,11 +29,14 @@ __all__ = [
     "MemoryLimitInfeasibleError",
     "BudgetExhaustedError",
     "find_plan",
+    "find_sliced_plan",
     "pareto_front",
     "format_tree",
 ]
 
 MAX_TENSORS = 10
+# find_sliced_plan 对每个切片都要完整调用一次规划器，切片数给出明确接口边界。
+MAX_SLICES = 64
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +174,42 @@ class ContractionPlan:
     steps: tuple[ContractStep, ...]
     tree: tuple
     tree_text: str
+
+
+@dataclass(frozen=True)
+class SlicedPlan:
+    """沿一个可切片收缩轴切块、逐切片收缩后的整体计划。
+
+    sliced_axis:  被切片的收缩轴标签（恰出现于两个输入）。
+    slice_size:   每片覆盖的该轴坐标数（最后一片可能更小）。
+    num_slices:   切片数 ceil(轴维大小 / slice_size)。
+    slices:       逐切片计划（S0..S{k-1} 顺序）；每个都是 find_plan
+                  风格的完整 ContractionPlan，部分输出轴恒为最终输出轴
+                  （被切轴在片内即被收缩，不出现在部分输出中）。
+    total_mult_count: 全部切片标量乘法之和（用旧规划器逐片累计）。
+    total_add_count:  把各片部分输出累加到常驻输出所需的标量加法数，
+                      即 (num_slices - 1) * 输出元素数；首片初始化、
+                      之后每片逐输出元素一次加法。
+    peak_memory:  整体执行的峰值驻留（标量元素）。自第二片起，上一片
+                  产出的完整输出作为常驻累加器（output_size 个元素）
+                  在该片求值期间始终驻留；峰值 =
+                  max(首片计划峰值, output_size + 其余各片计划峰值)。
+    output_size:  最终输出的标量元素数（累加器大小）。
+    output_axes / output_shape: 最终输出轴（出现 1 次的标签）与形状。
+    """
+
+    tensors: tuple[TensorSpec, ...]
+    memory_limit: Optional[int]
+    sliced_axis: str
+    slice_size: int
+    num_slices: int
+    slices: tuple[ContractionPlan, ...]
+    total_mult_count: int
+    total_add_count: int
+    peak_memory: int
+    output_size: int
+    output_axes: tuple[str, ...]
+    output_shape: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -570,6 +611,29 @@ def _build_trivial_plan(specs, label_size, limit, labels_order):
 
 
 # ---------------------------------------------------------------------------
+# 规划核心（find_plan 与逐切片规划共用）
+# ---------------------------------------------------------------------------
+
+
+def _plan_core(specs, label_size, label_count, limit, budget, labels_order):
+    """输入已校验；返回满足 limit 的最优 ContractionPlan（n>=1）。"""
+    if len(specs) == 1:
+        return _build_trivial_plan(specs, label_size, limit, labels_order)
+    _check_connected(specs, label_count)
+    entry, _fronts, _ax, _sz, _lo = _solve(
+        specs, label_size, label_count, limit, budget
+    )
+    plan = _build_plan(specs, label_size, limit, entry, labels_order)
+    # 内部不变量：DP 中已按 limit 精确剪枝，重建出的计划不可能超限。
+    if plan.peak_memory > limit:
+        raise TensorPlanningError(
+            "内部不变量被破坏：计划峰值 %d 超过上限 %d"
+            % (plan.peak_memory, limit)
+        )
+    return plan
+
+
+# ---------------------------------------------------------------------------
 # 公开接口
 # ---------------------------------------------------------------------------
 
@@ -599,20 +663,168 @@ def find_plan(tensors, memory_limit: int, *, search_budget: Optional[int] = None
         for lbl in t.axes:
             if lbl not in labels_order:
                 labels_order.append(lbl)
-    if len(specs) == 1:
-        return _build_trivial_plan(specs, label_size, limit, labels_order)
-    _check_connected(specs, label_count)
-    entry, _fronts, _ax, _sz, _lo = _solve(
-        specs, label_size, label_count, limit, budget
+    return _plan_core(
+        specs, label_size, label_count, limit, budget, labels_order
     )
-    plan = _build_plan(specs, label_size, limit, entry, labels_order)
-    # 内部不变量：DP 中已按 limit 精确剪枝，重建出的计划不可能超限。
-    if plan.peak_memory > limit:
-        raise TensorPlanningError(
-            "内部不变量被破坏：计划峰值 %d 超过上限 %d"
-            % (plan.peak_memory, limit)
+
+
+def find_sliced_plan(
+    tensors,
+    memory_limit: int,
+    sliced_axis: str,
+    slice_size: int,
+    *,
+    search_budget: Optional[int] = None,
+):
+    """沿一个可切片的收缩轴切块，对每个切片沿用 find_plan 的规划器。
+
+    参数:
+        tensors: 1..MAX_TENSORS 个 TensorSpec（被切轴必须恰出现于两个
+            输入，即为收缩轴；只出现一次的输出轴不可切）。
+        memory_limit: 正整数。切片规划以“片内峰值 + 常驻累加器”为约束：
+            首片无累加器，其余各片要求 plan.peak_memory + 输出元素数
+            <= memory_limit；任一片不满足即 MemoryLimitInfeasibleError。
+        sliced_axis: 要切片的收缩轴标签（非空 str）。
+        slice_size: 正整数，每片覆盖的该轴坐标数；最后一片可能更小。
+            切片数超过 MAX_SLICES 时按非法输入拒绝。
+        search_budget: None 或正整数；为每片独立规划的候选求值次数上限
+            （每片各自一份预算，耗尽抛 BudgetExhaustedError）。
+
+    返回: SlicedPlan（逐切片计划、累计乘法数、累加加法数、含常驻累加器
+        的整体峰值）。失败只抛异常，不产生任何半更新状态。
+
+    异常:
+        InvalidProblemError: 参数或切片设置违反契约。
+        DisconnectedNetworkError / MemoryLimitInfeasibleError /
+        BudgetExhaustedError: 语义同 find_plan，发生在任一切片规划中。
+    """
+    specs, label_size, label_count, limit, budget = _validate(
+        tensors, memory_limit, search_budget
+    )
+    if not isinstance(sliced_axis, str) or not sliced_axis:
+        raise InvalidProblemError(
+            "sliced_axis 必须是非空 str，得到 %r" % (sliced_axis,)
         )
-    return plan
+    if sliced_axis not in label_count:
+        raise InvalidProblemError(
+            "sliced_axis %r 不是任何输入张量的轴标签" % (sliced_axis,)
+        )
+    if label_count[sliced_axis] != 2:
+        raise InvalidProblemError(
+            "sliced_axis %r 出现 %d 次；只能对恰出现 2 次的收缩轴切片"
+            % (sliced_axis, label_count[sliced_axis])
+        )
+    if isinstance(slice_size, bool):
+        raise InvalidProblemError("slice_size 不得为 bool 类型")
+    if isinstance(slice_size, float):
+        if not math.isfinite(slice_size):
+            raise InvalidProblemError("slice_size 不得为 NaN/Infinity")
+        raise InvalidProblemError(
+            "slice_size 必须是精确正整数，得到 float %r" % (slice_size,)
+        )
+    if not isinstance(slice_size, int) or slice_size < 1:
+        raise InvalidProblemError(
+            "slice_size 必须是正整数，得到 %r" % (slice_size,)
+        )
+
+    axis_dim = label_size[sliced_axis]
+    num_slices = (axis_dim + slice_size - 1) // slice_size
+    if num_slices > MAX_SLICES:
+        raise InvalidProblemError(
+            "轴 %r 维大小 %d、每片 %d 将产生 %d 个切片，超过接口上限 %d"
+            % (sliced_axis, axis_dim, slice_size, num_slices, MAX_SLICES)
+        )
+
+    labels_order: list[str] = []
+    for t in specs:
+        for lbl in t.axes:
+            if lbl not in labels_order:
+                labels_order.append(lbl)
+    output_axes = tuple(a for a in labels_order if label_count[a] == 1)
+    output_shape = tuple(label_size[a] for a in output_axes)
+    output_size = math.prod(output_shape)
+
+    owners = [
+        i for i, t in enumerate(specs) if sliced_axis in t.axes
+    ]
+    assert len(owners) == 2
+
+    sliced_plans: list[ContractionPlan] = []
+    total_mult = 0
+    peak_overall = 0
+    # 逐片规划：所有片先全部成功才构造 SlicedPlan（失败不留下半更新状态）。
+    for k in range(num_slices):
+        lo = k * slice_size
+        width = min(slice_size, axis_dim - lo)
+        owners_set = set(owners)
+        slice_specs: list[TensorSpec] = []
+        for i, t in enumerate(specs):
+            if i not in owners_set:
+                slice_specs.append(t)
+                continue
+            p = t.axes.index(sliced_axis)
+            # 被切轴移到该张量轴序末尾：等价重排，且对两个属主一致，
+            # 使两个片输入共享同一被切轴，片内即完成该块收缩。
+            new_axes = tuple(a for q, a in enumerate(t.axes) if q != p)
+            new_shape = tuple(
+                d for q, d in enumerate(t.shape) if q != p
+            )
+            slice_specs.append(
+                TensorSpec(
+                    t.name, new_axes + (sliced_axis,), new_shape + (width,)
+                )
+            )
+        slice_label_size = dict(label_size)
+        slice_label_size[sliced_axis] = width
+
+        # 首片无常驻累加器；自第二片起，累加器（上一片产出的完整输出）
+        # 在整片求值期间驻留，片内可用峰值上限相应扣减。
+        held = 0 if k == 0 else output_size
+        slice_limit = limit - held
+        try:
+            plan_k = _plan_core(
+                tuple(slice_specs),
+                slice_label_size,
+                label_count,
+                slice_limit,
+                budget,
+                labels_order,
+            )
+        except InfeasibleError as e:
+            raise type(e)(
+                "切片 %d（轴 %r 坐标 [%d,%d)，片内峰值预算 %d）规划失败：%s"
+                % (k, sliced_axis, lo, lo + width, slice_limit, e)
+            ) from e
+        except BudgetExhaustedError as e:
+            raise BudgetExhaustedError(
+                "切片 %d（轴 %r 坐标 [%d,%d)）规划预算耗尽：%s"
+                % (k, sliced_axis, lo, lo + width, e)
+            ) from e
+        # 片内被切轴必须被完全收缩：部分输出轴恒等于最终输出轴。
+        if plan_k.output_axes != output_axes:
+            raise TensorPlanningError(
+                "内部不变量被破坏：切片 %d 的部分输出轴 %r != 最终输出轴 %r"
+                % (k, plan_k.output_axes, output_axes)
+            )
+        sliced_plans.append(plan_k)
+        total_mult += plan_k.total_mult_count
+        peak_overall = max(peak_overall, held + plan_k.peak_memory)
+
+    total_add = (num_slices - 1) * output_size
+    return SlicedPlan(
+        tensors=tuple(specs),
+        memory_limit=limit,
+        sliced_axis=sliced_axis,
+        slice_size=slice_size,
+        num_slices=num_slices,
+        slices=tuple(sliced_plans),
+        total_mult_count=total_mult,
+        total_add_count=total_add,
+        peak_memory=peak_overall,
+        output_size=output_size,
+        output_axes=output_axes,
+        output_shape=output_shape,
+    )
 
 
 def pareto_front(tensors, *, search_budget: Optional[int] = None):
