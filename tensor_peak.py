@@ -16,9 +16,11 @@ from typing import Optional, Sequence
 __all__ = [
     "MAX_TENSORS",
     "TensorSpec",
+    "SliceDim",
     "OperandRef",
     "ContractStep",
     "ContractionPlan",
+    "SlicedPlan",
     "FrontPoint",
     "TensorPlanningError",
     "InvalidProblemError",
@@ -27,6 +29,7 @@ __all__ = [
     "MemoryLimitInfeasibleError",
     "BudgetExhaustedError",
     "find_plan",
+    "plan_slices",
     "pareto_front",
     "format_tree",
 ]
@@ -121,6 +124,38 @@ class TensorSpec:
 
 
 @dataclass(frozen=True)
+class SliceDim:
+    """调用者指定的可切片维度：沿轴 axis 切成给定的若干块。
+
+    axis:  问题中存在的维度标签（出现 1 次为输出轴，2 次为收缩轴）。
+    slices: 各切片在该轴上的长度，正整数序列，之和必须等于该维总大小；
+            允许不等长。每个切片是一个独立的缩小子问题。
+    """
+
+    axis: str
+    slices: tuple[int, ...]
+
+    def __init__(self, axis, slices):
+        if not isinstance(axis, str) or not axis:
+            raise InvalidProblemError(
+                "SliceDim.axis 必须是非空 str，得到 %r" % (axis,)
+            )
+        if isinstance(slices, str) or not isinstance(slices, Sequence):
+            raise InvalidProblemError(
+                "SliceDim.slices 必须是正整数序列"
+            )
+        chunks = tuple(slices)
+        if not chunks:
+            raise InvalidProblemError(
+                "SliceDim.slices 至少包含 1 个切片（轴 %r）" % axis
+            )
+        for p, c in enumerate(chunks):
+            _check_dimension(c, "轴 %r 的第 %d 个切片长度" % (axis, p))
+        object.__setattr__(self, "axis", axis)
+        object.__setattr__(self, "slices", chunks)
+
+
+@dataclass(frozen=True)
 class OperandRef:
     """收缩步骤中一个操作数的描述（原始输入或中间结果）。"""
 
@@ -153,6 +188,8 @@ class ContractStep:
     mult_count: int
     residency: tuple[tuple[str, int], ...]
     peak_at_step: int
+    sliced_axis: Optional[str] = None
+    slice_index: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -169,6 +206,30 @@ class ContractionPlan:
     steps: tuple[ContractStep, ...]
     tree: tuple
     tree_text: str
+    slicing: Optional[SliceDim] = None
+
+
+@dataclass(frozen=True)
+class SlicedPlan:
+    """沿单个可切片维度切块后的逐切片规划结果。
+
+    slices:        每个切片一个 ContractionPlan（切片下标 0..k-1），
+                   其步骤名在各自命名空间内独立（都是 T0,T1,...）。
+    total_mult_count: 全部切片标量乘法数之和（输出累加的代价已计入）。
+    peak_intermediate_storage: 逐切片顺序执行时的峰值中间存储
+                   （标量元素数）= 各切片计划峰值的最大值。
+    peak_slice:    达到该峰值的切片下标。
+    accumulator_cost: 输出累加引入的额外标量乘法/加法计数。
+    slice_axis / slice_sizes: 切块维度与各块长度（便于审计）。
+    """
+
+    slices: tuple[ContractionPlan, ...]
+    total_mult_count: int
+    peak_intermediate_storage: int
+    peak_slice: int
+    accumulator_cost: int
+    slice_axis: str
+    slice_sizes: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -613,6 +674,132 @@ def find_plan(tensors, memory_limit: int, *, search_budget: Optional[int] = None
             % (plan.peak_memory, limit)
         )
     return plan
+
+
+def plan_slices(tensors, memory_limit, slice_dim, *, search_budget=None):
+    """沿调用者指定的单个可切片维度切块，对每个切片沿用 find_plan 规划。
+
+    把维度 ``slice_dim.axis`` 按 ``slice_dim.slices`` 切成 k 个独立子问题，
+    逐个用旧规划器（同一套子集 DP、同一口径的 memory_limit）求最优计划，再把
+    各片结果汇总：
+
+    - 切**收缩轴**（标签出现 2 次）：每个切片把该轴维长改为块长后照常收缩，
+      各片得到形状相同的部分结果，需跨片相加。输出累加成本（额外标量运算数）
+      = ``(k-1) * 输出元素数``，计入 total_mult_count 并单列在
+      accumulator_cost。峰值**中间**存储按各切片计划自身的峰值取最大值
+      （peak_intermediate_storage）；跨片输出累加器属于输出存储，按既有口径
+      原始/输出缓冲不计入中间驻留，故不并入该峰值，仅以累加成本体现。
+    - 切**输出轴**（标签出现 1 次）：各片产出最终输出沿该轴的不相交分块，
+      直接拼接即得完整结果，accumulator_cost 为 0，峰值中间存储同为各片计划
+      峰值的最大值。
+
+    memory_limit 对每个切片单独、按旧规划器口径生效；任一切片在该上限下
+    不可行即整体抛错（不返回半更新结果）。
+
+    参数与 find_plan 相同，另加 slice_dim（SliceDim）。返回 SlicedPlan。
+
+    异常:
+        InvalidProblemError: slice_dim 非法、轴不存在、块长之和不等于维大小等。
+        DisconnectedNetworkError / MemoryLimitInfeasibleError /
+        BudgetExhaustedError: 任一切片上的规划失败即整体失败（不返回部分结果）。
+    """
+    specs, label_size, label_count, limit, budget = _validate(
+        tensors, memory_limit, search_budget
+    )
+    if not isinstance(slice_dim, SliceDim):
+        raise InvalidProblemError(
+            "slice_dim 必须是 SliceDim，得到 %r" % (type(slice_dim).__name__,)
+        )
+    axis = slice_dim.axis
+    if axis not in label_size:
+        raise InvalidProblemError(
+            "切片轴 %r 不出现在任何输入张量中" % axis
+        )
+    total_size = label_size[axis]
+    if sum(slice_dim.slices) != total_size:
+        raise InvalidProblemError(
+            "切片轴 %r 的块长之和 %d != 维大小 %d"
+            % (axis, sum(slice_dim.slices), total_size)
+        )
+
+    is_output_axis = label_count[axis] == 1
+
+    def build_slice(chunk):
+        sliced = []
+        for t in specs:
+            if axis not in t.axes:
+                sliced.append(t)
+                continue
+            new_shape = tuple(
+                chunk if lbl == axis else d
+                for lbl, d in zip(t.axes, t.shape)
+            )
+            sliced.append(TensorSpec(t.name, t.axes, new_shape))
+        return tuple(sliced)
+
+    output_size = math.prod(
+        d for lbl, d in label_size.items() if label_count[lbl] == 1
+    )
+
+    slice_plans: list[ContractionPlan] = []
+    for s, chunk in enumerate(slice_dim.slices):
+        sub_specs = build_slice(chunk)
+        plan = find_plan(sub_specs, limit, search_budget=budget)
+        slice_plans.append(_tag_plan_slicing(plan, slice_dim, s))
+
+    sum_muls = sum(p.total_mult_count for p in slice_plans)
+    if is_output_axis:
+        accum_cost = 0
+    else:
+        accum_cost = (len(slice_plans) - 1) * output_size
+    peaks = [p.peak_memory for p in slice_plans]
+    peak = max(peaks, default=0)
+    peak_slice = peaks.index(peak) if peaks else 0
+
+    return SlicedPlan(
+        slices=tuple(slice_plans),
+        total_mult_count=sum_muls + accum_cost,
+        peak_intermediate_storage=peak,
+        peak_slice=peak_slice,
+        accumulator_cost=accum_cost,
+        slice_axis=axis,
+        slice_sizes=tuple(slice_dim.slices),
+    )
+
+
+def _tag_plan_slicing(plan, slice_dim, index):
+    """返回带 sliced_axis/slice_index 标注的计划副本（步骤与计划级字段）。"""
+    steps = tuple(
+        ContractStep(
+            index=s.index,
+            output_name=s.output_name,
+            lhs=s.lhs,
+            rhs=s.rhs,
+            evaluated_first=s.evaluated_first,
+            contracted_axes=s.contracted_axes,
+            output_axes=s.output_axes,
+            output_shape=s.output_shape,
+            mult_count=s.mult_count,
+            residency=s.residency,
+            peak_at_step=s.peak_at_step,
+            sliced_axis=slice_dim.axis,
+            slice_index=index,
+        )
+        for s in plan.steps
+    )
+    return ContractionPlan(
+        tensors=plan.tensors,
+        memory_limit=plan.memory_limit,
+        output_axes=plan.output_axes,
+        output_shape=plan.output_shape,
+        total_mult_count=plan.total_mult_count,
+        peak_memory=plan.peak_memory,
+        peak_step=plan.peak_step,
+        steps=steps,
+        tree=plan.tree,
+        tree_text=plan.tree_text,
+        slicing=slice_dim,
+    )
 
 
 def pareto_front(tensors, *, search_budget: Optional[int] = None):
