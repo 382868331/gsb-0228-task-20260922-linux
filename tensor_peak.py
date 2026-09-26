@@ -4,11 +4,17 @@
 DP + (标量乘法数, 峰值驻留) Pareto 前沿，在两两收缩、禁止外积的前提下，
 求满足内存上限的最少标量乘法收缩计划，并输出括号树、逐步形状与峰值证据。
 
+可选的指标奇偶标记：每个维度标签可标记为偶(0)或奇(1)。为收缩而把操作数
+置换到规范轴序时，每交换一对奇指标贡献一个 -1 符号；计划逐步记录轴排列、
+奇指标交换次数与符号，execute_plan 按此执行带符号数值收缩。不做任何
+标记时全部指标为偶，符号恒为 +1，行为与无标记版本完全一致。
+
 本模块只使用 Python 标准库，全部计算为精确整数运算，不涉及浮点误差。
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -29,6 +35,7 @@ __all__ = [
     "find_plan",
     "pareto_front",
     "format_tree",
+    "execute_plan",
 ]
 
 MAX_TENSORS = 10
@@ -75,13 +82,16 @@ class TensorSpec:
     name:  唯一张量名（非空 str）。
     axes:  维度标签元组（非空 str，同一张量内不得重复）。
     shape: 与 axes 等长的正整数维大小。
+    parities: 可选，与 axes 等长的 0/1 元组（0=偶, 1=奇）；None 表示
+        本张量不提供奇偶信息。同一标签在所有标记处必须一致。
     """
 
     name: str
     axes: tuple[str, ...]
     shape: tuple[int, ...]
+    parities: Optional[tuple[int, ...]] = None
 
-    def __init__(self, name, axes, shape):
+    def __init__(self, name, axes, shape, parities=None):
         if not isinstance(name, str) or not name:
             raise InvalidProblemError(
                 "TensorSpec.name 必须是非空 str，得到 %r" % (name,)
@@ -111,9 +121,27 @@ class TensorSpec:
                 "张量 %r 的 axes/shape 长度不一致: %d != %d"
                 % (name, len(axes), len(shape))
             )
+        if parities is not None:
+            if isinstance(parities, str) or not isinstance(parities, Sequence):
+                raise InvalidProblemError(
+                    "张量 %r 的 parities 必须是 0/1 序列或 None" % (name,)
+                )
+            parities = tuple(parities)
+            if len(parities) != len(axes):
+                raise InvalidProblemError(
+                    "张量 %r 的 parities 长度 %d 与 axes 长度 %d 不一致"
+                    % (name, len(parities), len(axes))
+                )
+            for p, m in enumerate(parities):
+                if isinstance(m, bool) or not isinstance(m, int) or m not in (0, 1):
+                    raise InvalidProblemError(
+                        "张量 %r 的第 %d 个轴(%s)奇偶标记必须是 0 或 1，得到 %r"
+                        % (name, p, axes[p], m)
+                    )
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "axes", axes)
         object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "parities", parities)
 
     @property
     def size(self) -> int:
@@ -153,6 +181,13 @@ class ContractStep:
     mult_count: int
     residency: tuple[tuple[str, int], ...]
     peak_at_step: int
+    # 奇偶符号证据：为收缩把操作数置换到规范轴序的排列（canonical =
+    # [axes[i] for i in permutation]）、其中奇指标对的交换次数及符号。
+    # 无奇偶标记时排列仍为规范排列、交换次数为 0、符号恒为 +1。
+    lhs_axis_permutation: tuple[int, ...] = ()
+    rhs_axis_permutation: tuple[int, ...] = ()
+    odd_swap_count: int = 0
+    sign: int = 1
 
 
 @dataclass(frozen=True)
@@ -169,6 +204,9 @@ class ContractionPlan:
     steps: tuple[ContractStep, ...]
     tree: tuple
     tree_text: str
+    # 整个计划的净符号（各步符号之积；单张量平凡计划为输入轴序
+    # 置换到规范输出轴序的符号）。无奇偶标记时恒为 +1。
+    sign: int = 1
 
 
 @dataclass(frozen=True)
@@ -265,13 +303,29 @@ def _validate(tensors, memory_limit, search_budget):
             % (bad, "、".join(str(label_count[b]) for b in bad))
         )
 
+    # 奇偶标记按标签汇总：同一标签在所有标记处必须一致；未标记的
+    # 张量不提供约束。全部未标记时 label_parity 为空（全部按偶处理）。
+    label_parity: dict[str, int] = {}
+    for t in specs:
+        if t.parities is None:
+            continue
+        for lbl, m in zip(t.axes, t.parities):
+            if lbl in label_parity:
+                if label_parity[lbl] != m:
+                    raise InvalidProblemError(
+                        "指标 %r 的奇偶标记冲突: %d != %d（出现于张量 %r）"
+                        % (lbl, label_parity[lbl], m, t.name)
+                    )
+            else:
+                label_parity[lbl] = m
+
     limit = _check_positive_int(
         memory_limit, "memory_limit", allow_none=False
     )
     budget = _check_positive_int(
         search_budget, "search_budget", allow_none=True
     )
-    return tuple(specs), label_size, label_count, limit, budget
+    return tuple(specs), label_size, label_count, label_parity, limit, budget
 
 
 def _check_connected(specs, label_count) -> None:
@@ -462,7 +516,29 @@ def _solve(specs, label_size, label_count, limit, budget):
 # ---------------------------------------------------------------------------
 
 
-def _build_plan(specs, label_size, limit, entry, labels_order):
+def _canonical_perm(axes, labels_order):
+    """返回把 axes 置换到规范轴序（labels_order 过滤）的排列 perm，
+    满足 canonical = [axes[i] for i in perm]。"""
+    owned = set(axes)
+    return tuple(axes.index(a) for a in labels_order if a in owned)
+
+
+def _count_odd_swaps(axes, perm, label_parity):
+    """置换 perm 中奇指标对的逆序数（即相邻交换展开下的奇-奇交换次数）。"""
+    swaps = 0
+    for x in range(len(perm)):
+        lx = axes[perm[x]]
+        if not label_parity.get(lx, 0):
+            continue
+        for y in range(x + 1, len(perm)):
+            if perm[x] > perm[y] and label_parity.get(axes[perm[y]], 0):
+                swaps += 1
+    return swaps
+
+
+def _build_plan(
+    specs, label_size, limit, entry, labels_order, label_parity
+):
     by_name = {t.name: t for t in specs}
     steps: list[ContractStep] = []
     counter = [0]
@@ -470,6 +546,9 @@ def _build_plan(specs, label_size, limit, entry, labels_order):
     def ref_input(name):
         t = by_name[name]
         return OperandRef("input", name, t.axes, t.shape, t.size, None)
+
+    def perm_of(ref):
+        return _canonical_perm(ref.axes, labels_order)
 
     def emit(tree, held: tuple[tuple[str, int], ...]):
         """求值 tree；held 为求值期间始终驻留的（中间量名, 大小）。"""
@@ -503,6 +582,11 @@ def _build_plan(specs, label_size, limit, entry, labels_order):
             (rhs.name, rhs.size),
             (out_name, out_size),
         )
+        lhs_perm = perm_of(lhs)
+        rhs_perm = perm_of(rhs)
+        odd_swaps = _count_odd_swaps(
+            lhs.axes, lhs_perm, label_parity
+        ) + _count_odd_swaps(rhs.axes, rhs_perm, label_parity)
         step = ContractStep(
             index=idx,
             output_name=out_name,
@@ -515,6 +599,10 @@ def _build_plan(specs, label_size, limit, entry, labels_order):
             mult_count=node_muls,
             residency=residency,
             peak_at_step=sum(sz for _, sz in residency),
+            lhs_axis_permutation=lhs_perm,
+            rhs_axis_permutation=rhs_perm,
+            odd_swap_count=odd_swaps,
+            sign=-1 if odd_swaps % 2 else 1,
         )
         steps.append(step)
         return out_ref
@@ -536,6 +624,10 @@ def _build_plan(specs, label_size, limit, entry, labels_order):
     )
     output_shape = tuple(label_size[a] for a in output_axes)
 
+    plan_sign = 1
+    for s in steps:
+        plan_sign *= s.sign
+
     return ContractionPlan(
         tensors=tuple(specs),
         memory_limit=limit,
@@ -547,14 +639,17 @@ def _build_plan(specs, label_size, limit, entry, labels_order):
         steps=tuple(steps),
         tree=entry.tree,
         tree_text=format_tree(entry.tree),
+        sign=plan_sign,
     )
 
 
-def _build_trivial_plan(specs, label_size, limit, labels_order):
+def _build_trivial_plan(specs, label_size, limit, labels_order, label_parity=None):
     t = specs[0]
     output_axes = tuple(
         lbl for lbl in labels_order if sum(lbl in x.axes for x in specs) == 1
     )
+    perm = _canonical_perm(t.axes, labels_order)
+    swaps = _count_odd_swaps(t.axes, perm, label_parity or {})
     return ContractionPlan(
         tensors=tuple(specs),
         memory_limit=limit,
@@ -566,6 +661,7 @@ def _build_trivial_plan(specs, label_size, limit, labels_order):
         steps=(),
         tree=("leaf", t.name),
         tree_text=format_tree(("leaf", t.name)),
+        sign=-1 if swaps % 2 else 1,
     )
 
 
@@ -591,7 +687,7 @@ def find_plan(tensors, memory_limit: int, *, search_budget: Optional[int] = None
         MemoryLimitInfeasibleError: 完整穷举后证明无满足上限的计划。
         BudgetExhaustedError: 预算耗尽，尚未证明无解。
     """
-    specs, label_size, label_count, limit, budget = _validate(
+    specs, label_size, label_count, label_parity, limit, budget = _validate(
         tensors, memory_limit, search_budget
     )
     labels_order: list[str] = []
@@ -600,12 +696,16 @@ def find_plan(tensors, memory_limit: int, *, search_budget: Optional[int] = None
             if lbl not in labels_order:
                 labels_order.append(lbl)
     if len(specs) == 1:
-        return _build_trivial_plan(specs, label_size, limit, labels_order)
+        return _build_trivial_plan(
+            specs, label_size, limit, labels_order, label_parity
+        )
     _check_connected(specs, label_count)
     entry, _fronts, _ax, _sz, _lo = _solve(
         specs, label_size, label_count, limit, budget
     )
-    plan = _build_plan(specs, label_size, limit, entry, labels_order)
+    plan = _build_plan(
+        specs, label_size, limit, entry, labels_order, label_parity
+    )
     # 内部不变量：DP 中已按 limit 精确剪枝，重建出的计划不可能超限。
     if plan.peak_memory > limit:
         raise TensorPlanningError(
@@ -621,7 +721,7 @@ def pareto_front(tensors, *, search_budget: Optional[int] = None):
     用于观察成本/内存权衡：前沿上没有点在两个目标上同时更优。
     异常语义同 find_plan（无 memory_limit 相关拒绝）。
     """
-    specs, label_size, label_count, _limit, budget = _validate(
+    specs, label_size, label_count, _parity, _limit, budget = _validate(
         tensors, 10**30, search_budget
     )
     labels_order: list[str] = []
@@ -653,3 +753,119 @@ def format_tree(tree) -> str:
         format_tree(tr),
         ",".join(out_axes) if out_axes else "scalar",
     )
+
+
+# ---------------------------------------------------------------------------
+# 带符号执行器
+# ---------------------------------------------------------------------------
+
+
+def _permute_data(axes, data, perm, sign, where):
+    """按 perm 重排稠密数据键并乘符号；perm 为空元组视为恒等（兼容
+    未记录排列的旧式手工构造步骤）。"""
+    if not perm:
+        perm = tuple(range(len(axes)))
+    out = {}
+    for key, value in data.items():
+        if not isinstance(key, tuple) or len(key) != len(axes):
+            raise InvalidProblemError(
+                "%s 的数据键 %r 与轴数 %d 不符" % (where, key, len(axes))
+            )
+        out[tuple(key[i] for i in perm)] = sign * value
+    return out
+
+
+def execute_plan(plan, values):
+    """按计划逐步执行带奇偶符号的稠密收缩，返回 {输出索引元组: 值}。
+
+    参数:
+        plan: find_plan 返回的 ContractionPlan。
+        values: dict[张量名, dict[索引元组, 数值]]，按各输入张量自身的
+            轴序给值；索引越界或缺失会给出可定位的 InvalidProblemError。
+
+    每步先把两个操作数按步骤记录的轴排列置换到规范轴序（奇指标交换
+    的符号已计入 step.sign），再对收缩轴求和；最终输出轴序即
+    plan.output_axes 的规范顺序，净符号为 plan.sign。全部数值为精确
+    整数运算（输入整数时输出必为整数）。
+    """
+    if not isinstance(plan, ContractionPlan):
+        raise InvalidProblemError(
+            "plan 必须是 ContractionPlan，得到 %r" % type(plan).__name__
+        )
+    if not isinstance(values, dict):
+        raise InvalidProblemError("values 必须是 {张量名: {索引: 值}} 的 dict")
+
+    def fetch(ref, perm, sign):
+        if ref.kind == "input":
+            if ref.name not in values:
+                raise InvalidProblemError(
+                    "values 缺少输入张量 %r 的数据" % ref.name
+                )
+            data = values[ref.name]
+            if not isinstance(data, dict):
+                raise InvalidProblemError(
+                    "张量 %r 的数据必须是 {索引元组: 值} 的 dict" % ref.name
+                )
+            for key in data:
+                if not isinstance(key, tuple) or len(key) != len(ref.axes):
+                    raise InvalidProblemError(
+                        "张量 %r 的数据键 %r 与轴数 %d 不符"
+                        % (ref.name, key, len(ref.axes))
+                    )
+                for p, v in enumerate(key):
+                    if isinstance(v, bool) or not isinstance(v, int) or not (
+                        0 <= v < ref.shape[p]
+                    ):
+                        raise InvalidProblemError(
+                            "张量 %r 的数据键 %r 第 %d 维越界（维大小 %d）"
+                            % (ref.name, key, p, ref.shape[p])
+                        )
+            return _permute_data(ref.axes, data, perm, sign, "张量 %r" % ref.name)
+        return _permute_data(
+            ref.axes, live[ref.name], perm, sign, "中间量 %r" % ref.name
+        )
+
+    live: dict[str, dict] = {}
+    for step in plan.steps:
+        dat_l = fetch(step.lhs, step.lhs_axis_permutation, 1)
+        dat_r = fetch(step.rhs, step.rhs_axis_permutation, 1)
+        ax_l = [step.lhs.axes[i] for i in (
+            step.lhs_axis_permutation or range(len(step.lhs.axes))
+        )]
+        ax_r = [step.rhs.axes[i] for i in (
+            step.rhs_axis_permutation or range(len(step.rhs.axes))
+        )]
+        sizes = dict(zip(step.lhs.axes, step.lhs.shape))
+        sizes.update(zip(step.rhs.axes, step.rhs.shape))
+        union_axes = list(ax_l) + [a for a in ax_r if a not in set(ax_l)]
+        out: dict = {}
+        for combo in _product_ranges([sizes[a] for a in union_axes]):
+            pos = dict(zip(union_axes, combo))
+            kl = tuple(pos[a] for a in ax_l)
+            kr = tuple(pos[a] for a in ax_r)
+            ko = tuple(pos[a] for a in step.output_axes)
+            out[ko] = out.get(ko, 0) + dat_l[kl] * dat_r[kr]
+        if step.sign != 1:
+            out = {k: step.sign * v for k, v in out.items()}
+        live[step.output_name] = out
+        for op in (step.lhs, step.rhs):
+            if op.kind == "intermediate":
+                live.pop(op.name, None)
+
+    if not plan.steps:
+        # 单张量平凡计划：仅做输入轴序 -> 规范输出轴序的带符号转置。
+        t = plan.tensors[0]
+        if t.name not in values:
+            raise InvalidProblemError(
+                "values 缺少输入张量 %r 的数据" % t.name
+            )
+        perm = _canonical_perm(t.axes, plan.output_axes)
+        return _permute_data(
+            t.axes, values[t.name], perm, plan.sign, "张量 %r" % t.name
+        )
+    return live[plan.steps[-1].output_name]
+
+
+def _product_ranges(dims):
+    """itertools.product(*(range(d) for d in dims))。"""
+    return itertools.product(*(range(d) for d in dims))

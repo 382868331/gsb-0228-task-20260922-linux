@@ -14,8 +14,13 @@
 ## 运行命令
 
 ```bash
+# 准备虚拟环境（仅标准库，无第三方依赖；已激活或已有解释器可跳过）
+python3.14 -m venv .venv
+source .venv/bin/activate
+
 python -m unittest discover -s tests -v   # 必要测试（含独立参考交叉验证）
-python demo.py                            # 固定输入演示（约 0.1 秒）
+python demo_iteration.py                  # 奇偶符号增量演示（现场计算，约 0.1 秒）
+python demo.py                            # 基线固定输入演示（约 0.1 秒）
 ```
 
 ## 问题模型与内存口径
@@ -32,11 +37,31 @@ python demo.py                            # 固定输入演示（约 0.1 秒）
   释放。每个节点可以选择**先求值左子树还是右子树**以压低峰值。
 - `memory_limit` 是对该峰值（标量元素数）的硬上限。
 
+## 指标奇偶标记与符号（可选增量）
+
+- 每个维度标签可标记固定奇偶：`TensorSpec(..., parities=(0|1, ...))` 与
+  `axes` 等长，0=偶、1=奇；`None`（默认）表示不标记。同一标签在所有
+  标记处必须一致，冲突直接 `InvalidProblemError`；完全不做标记时行为与
+  无标记版本**完全一致**（符号恒 +1）。
+- **规范轴序** = 标签在全部输入中的首次出现顺序；所有中间结果与最终输出
+  都按该顺序排列，所有计划返回同一 `output_axes` 规范顺序。
+- **符号约定**：每个收缩步把两个操作数分别置换到规范轴序；置换中每交换
+  一对**奇指标**贡献一个 -1（奇-偶、偶-偶交换不计）。步骤符号为两操作数
+  符号之积，计划净符号 `ContractionPlan.sign` 为各步符号之积。该约定只
+  依赖各操作数自身轴序，因此**与括号顺序无关**：不同括号树的带符号结果
+  相同（测试与演示均按此验证）。转置不是免费重排。
+- 计划在每步记录符号证据：`ContractStep.lhs_axis_permutation` /
+  `rhs_axis_permutation`（满足 `canonical = [axes[i] for i in perm]`）、
+  `odd_swap_count`（奇指标对交换次数）、`sign`（±1）。
+- `execute_plan(plan, values)` 是配套的带符号稠密执行器：
+  `values` 为 `{张量名: {索引元组: 值}}`（按各输入自身轴序给值），
+  返回 `{规范输出轴序索引元组: 值}`；输入整数时全部计算为精确整数。
+
 ## 公开接口
 
 ```python
 from tensor_peak import (
-    TensorSpec, find_plan, pareto_front, format_tree,
+    TensorSpec, find_plan, pareto_front, format_tree, execute_plan,
     # 数据结构
     OperandRef, ContractStep, ContractionPlan, FrontPoint, MAX_TENSORS,
     # 异常
@@ -46,9 +71,11 @@ from tensor_peak import (
 )
 ```
 
-- `TensorSpec(name: str, axes: tuple[str, ...], shape: tuple[int, ...])`
+- `TensorSpec(name: str, axes: tuple[str, ...], shape: tuple[int, ...],
+  parities: tuple[int, ...] | None = None)`
   不可变值对象；`name` 非空且全局唯一（保留名 `T0..T9` 禁止使用），同一张量
-  内轴标签不重复，`shape` 与 `axes` 等长、各项为正整数。
+  内轴标签不重复，`shape` 与 `axes` 等长、各项为正整数；`parities`
+  可选，与 `axes` 等长的 0/1 奇偶标记（拒绝 bool 与非 0/1 值）。
 - `find_plan(tensors, memory_limit, *, search_budget=None) -> ContractionPlan`
   - `tensors`：1..10 个 `TensorSpec`；
   - `memory_limit`：正整数峰值上限；
@@ -114,11 +141,20 @@ from tensor_peak import (
   n=10 上限规模等。
 - `tests/test_numeric.py`：独立的稠密逐元素执行器按计划逐步收缩，与独立直算
   枚举求和结果做精确 `==` 比对（往返一致只作补充，期望值不来自被测核心）。
+- `tests/test_parity.py`：奇偶标记增量。`reference_signed_sum` 是**独立**
+  参考：对全部指标做原始全指标求和，每个张量按“自身轴序 -> 规范轴序”的
+  显式置换计符号，不调用被测核心。覆盖：两次奇指标交换（符号 +1）、偶指标
+  穿插不计号、迹收缩 `A(i,j) B(j,i)` 的奇/偶/混合符号、不同括号顺序（不同
+  内存上限选出的不同树）带符号结果一致、无标记行为不变，以及奇偶长度/取值/
+  跨张量冲突、执行器缺张量/键维数错/索引越界等异常路径。
 
 ## 已知限制
 
 - 不做分块/布局/内核级内存建模，内存只计标量元素驻留。
 - 不支持标签出现 ≥3 次、外积、广播、稀疏张量；非法情形直接报错。
+- 奇偶符号只实现本题约定的子集：每个指标固定奇偶、普通有限维稠密小张量、
+  符号仅来自“各操作数分别置换到规范轴序”的奇-奇交换；不实现完整费米子
+  张量库的交叉费米符号、对称块稀疏或旋量结构。
 - 前沿可能随极端维大小组合变宽；n≤10 下预算默认关闭即可穷举，必要时可用
   `search_budget` 显式管理（耗尽时得到的是 `BudgetExhaustedError` 而非无解
   结论）。
