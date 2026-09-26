@@ -16,7 +16,92 @@
 ```bash
 python -m unittest discover -s tests -v   # 必要测试（含独立参考交叉验证）
 python demo.py                            # 固定输入演示（约 0.1 秒）
+python demo_iteration.py                  # 本轮：精度联合规划演示（<1 秒）
 ```
+
+## 环境准备（Linux 原生 Python 3.14.7）
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
+python --version        # 应为 Python 3.14.7
+```
+
+仅使用标准库，`requirements.txt` 无第三方依赖，不需要 `pip install`，
+全程离线（无 Docker、外部服务、网络或真实凭据）。
+
+## 本轮迭代：括号顺序 × 浮点精度联合规划
+
+在原“只按内存选括号顺序”之外，新增**每步两档模拟浮点精度**的联合规划：
+同时选择括号顺序与每步精度，在峰值元素数上限与**最终绝对误差上限**内
+最小化成本。规划只消费每个输入的**元素绝对值上界**与**已有绝对误差上界**，
+不读取真实大张量数据。
+
+```python
+from tensor_peak import (
+    TensorSpec, find_precision_plan, FP32, FP64, PRECISION_LEVELS,
+    ErrorLimitInfeasibleError, PrecisionInfeasibleError,
+    decimal_rounding_audit,
+)
+
+A = TensorSpec("A", ("i", "k"), (8, 10), abs_bound=1.5, abs_error=0)
+plan = find_precision_plan([A, B, C], memory_limit=10**9,
+                           error_limit=Fraction(1, 1000))
+```
+
+- 精度档（成本权重可通过自定义 `PrecisionLevel` 调整）：
+
+| 档 | 有效位 p | 单位舍入 u | 每次乘法成本 |
+|---|---|---|---|
+| `FP32` | 24 | 2⁻²⁴ | 1 |
+| `FP64` | 53 | 2⁻⁵³ | 4 |
+
+- `TensorSpec` 新增 `abs_bound`（默认 1）与 `abs_error`（默认 0），
+  接受 `int`/`Fraction`/`Decimal`/有限 `float`（负数与 NaN/Infinity 拒绝）。
+- `find_precision_plan(tensors, memory_limit, error_limit, *,
+  search_budget=None, levels=PRECISION_LEVELS) -> PrecisionContractionPlan`：
+  返回每步精度、内存驻留证据与逐步误差账本；按 `total_cost` 最小优化，
+  平局按峰值、误差。
+- `PrecisionContractStep` 字段：`precision`、`dot_length`（点积项数 K）、
+  `mult_count`、`step_cost`、`peak_at_step`、`lhs_bound`/`rhs_bound`、
+  `term_mag_sum`、`input_error_contribution`、`rounding_error`、
+  `total_abs_error`、`output_stored_bound`/`output_true_bound`。
+
+### 误差口径（标准点积舍入界，保守先验传播）
+
+一次收缩把每个输出元素视为 **K 项点积**（K = 收缩轴长度之积）。
+设两侧元素的存储幅度上界为 Mₗ、Mᵣ，已有绝对误差上界为 eₗ、eᵣ：
+
+- 项幅度和 S = K·Mₗ·Mᵣ；
+- 输入已有误差传播（一阶 + 交叉项）：
+  E_in = K·(eₗ·Mᵣ + eᵣ·Mₗ + eₗ·eᵣ)；
+- 舍入界（每项一次乘法一次舍入的标准 γ_K 界）：
+  γ_K = K·u/(1−K·u)，E_round = γ_K·S；
+- 输出存储幅度上界 M′ = S + E_round；输出总绝对误差 e′ = E_in + E_round。
+
+全部传播用 `fractions.Fraction` **精确有理运算**，不引入二进制浮点近似。
+当 K·u ≥ 1 时 γ_K 无界，该档精度对此步不可行（搜索中排除；若所有档都
+不可行，穷举后抛 `PrecisionInfeasibleError`）。界不满足的计划不会因为
+“小样本碰巧算得准”而被放行：判定只依据先验界。
+
+### Decimal 逐步舍入对照
+
+`decimal_rounding_audit(plan, *, fill_scales=None, fill_values=None, signs=())`
+在不读取真实张量的前提下，用不超过 `abs_bound` 的确定性常量填充，以
+`Decimal` 高有效数字模拟 **p 位二进制就近偶舍入**逐步执行计划，返回每步
+实测舍入误差与账本 `rounding_error` 的对照（实测恒 ≤ 账本界）。该函数
+仅用于核对界的保守性，不参与规划。
+
+### 无解与预算不足（仍然严格分开）
+
+| 异常 | 含义 |
+|---|---|
+| `PrecisionInfeasibleError` | 某步 K·u≥1，对全部给定精度都不存在有界误差 |
+| `MemoryLimitInfeasibleError` | 穷举证明峰值内存上限不可行 |
+| `ErrorLimitInfeasibleError` | 内存可行，但穷举全部顺序×精度后最终误差界仍超上限 |
+| `BudgetExhaustedError` | `search_budget` 耗尽，**未证明无解** |
+
+原 `find_plan`/`pareto_front`（只按内存规划，精确整数）接口与语义保持不变。
 
 ## 问题模型与内存口径
 
@@ -114,11 +199,22 @@ from tensor_peak import (
   n=10 上限规模等。
 - `tests/test_numeric.py`：独立的稠密逐元素执行器按计划逐步收缩，与独立直算
   枚举求和结果做精确 `==` 比对（往返一致只作补充，期望值不来自被测核心）。
+- `tests/reference_precision.py`：独立枚举**全部括号顺序 × 每步精度组合**，
+  自行书写 γ_K 误差传播与成本/峰值口径，不导入被测核心。
+- `tests/test_precision.py`：n=2..5 多档误差上限下与独立全枚举逐一比对；
+  混合精度选择、逐步账本恒等式、`Decimal` 对抗性舍入实测 ≤ 账本界、
+  K·u≥1 边界、预算耗尽与证明无解分离、非法输入、原接口保持等用例。
 
 ## 已知限制
 
 - 不做分块/布局/内核级内存建模，内存只计标量元素驻留。
 - 不支持标签出现 ≥3 次、外积、广播、稀疏张量；非法情形直接报错。
+- 误差界采用“每项一次乘法一次舍入、K 项求和”的 γ_K 标准先验模型；
+  不模拟 FMA 融合、补偿求和、舍入模式切换或硬件特定行为。输入只提供
+  统一的元素绝对值上界与已有误差上界，不做逐元素相关结构（相关性只会
+  让真实误差更小，故统一界对任何相关结构都保守成立）。
+- `decimal_rounding_audit` 的填充执行器面向小张量设计（演示/测试规模），
+  用于核对界；规划本身不执行填充、不随张量数据量变慢。
 - 前沿可能随极端维大小组合变宽；n≤10 下预算默认关闭即可穷举，必要时可用
   `search_budget` 显式管理（耗尽时得到的是 `BudgetExhaustedError` 而非无解
   结论）。
