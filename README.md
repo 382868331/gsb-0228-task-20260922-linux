@@ -14,9 +14,15 @@
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（含独立参考交叉验证）
-python demo.py                            # 固定输入演示（约 0.1 秒）
+python -m venv .venv
+. .venv/bin/activate
+python -m unittest discover -s tests -v
+python demo_iteration.py
 ```
+
+本项目只使用 Python 标准库；`requirements.txt` 为空，创建 venv 后无需安装
+第三方包。`demo_iteration.py` 使用确定性小整数现场计算，通常少于 1 秒，
+约束为 90 秒内完成。
 
 ## 问题模型与内存口径
 
@@ -36,7 +42,7 @@ python demo.py                            # 固定输入演示（约 0.1 秒）
 
 ```python
 from tensor_peak import (
-    TensorSpec, find_plan, pareto_front, format_tree,
+    TensorSpec, find_plan, pareto_front, format_tree, execute_plan,
     # 数据结构
     OperandRef, ContractStep, ContractionPlan, FrontPoint, MAX_TENSORS,
     # 异常
@@ -46,9 +52,11 @@ from tensor_peak import (
 )
 ```
 
-- `TensorSpec(name: str, axes: tuple[str, ...], shape: tuple[int, ...])`
+- `TensorSpec(name, axes, shape, parity=None)`
   不可变值对象；`name` 非空且全局唯一（保留名 `T0..T9` 禁止使用），同一张量
-  内轴标签不重复，`shape` 与 `axes` 等长、各项为正整数。
+  内轴标签不重复，`shape` 与 `axes` 等长、各项为正整数。可选 `parity` 是与
+  `axes` 等长的 `bool` 序列：`True` 表示奇指标，`False`/`None` 表示偶指标；
+  同一标签在所有输入中的固定奇偶必须一致。
 - `find_plan(tensors, memory_limit, *, search_budget=None) -> ContractionPlan`
   - `tensors`：1..10 个 `TensorSpec`；
   - `memory_limit`：正整数峰值上限；
@@ -62,8 +70,28 @@ from tensor_peak import (
 `ContractionPlan` 字段：`total_mult_count`、`peak_memory`、`peak_step`、
 `tree` / `tree_text`、`steps`、`output_axes` / `output_shape`。每个
 `ContractStep` 含左右操作数（`OperandRef`：原始输入或前序中间量）、
-`evaluated_first`、`contracted_axes`、输出形状、本步乘法数，以及
-`residency`（收缩瞬间完整驻留清单）与 `peak_at_step`，可逐步复核峰值证据。
+`evaluated_first`、`contracted_axes`、输出形状、本步乘法数、
+`operation_axes`（本步规范操作轴排列，收缩轴成对出现）、
+`lhs_permutation` / `rhs_permutation` / `output_permutation`、
+`odd_swaps`（仅统计两个奇指标之间的交换次数）、`sign`，以及
+`residency`（收缩瞬间完整驻留清单）与 `peak_at_step`，可逐步复核峰值和符号。
+`ContractionPlan.axis_parity` 保存标签到固定奇偶的映射，`parity_sign` 是全计划
+`step.sign` 的乘积。
+
+`execute_plan(plan, inputs=None)` 使用标准嵌套 `list` 稠密执行计划；省略
+`inputs` 时生成确定性小整数输入。执行器会显式应用每步记录的轴置换和符号，
+返回嵌套 `list`，完全收缩为标量时返回数值。
+
+### 奇指标符号口径
+
+- 未提供 `parity` 时所有指标均为偶指标，`odd_swaps=0`、`sign=1`，规划成本、
+  峰值和旧接口行为不变。
+- 每步把左右操作数的轴置换为该步的规范操作排列：输出轴按整网首次出现顺序，
+  收缩轴在目标排列中以配对形式出现。置换中的逆序只有两端都是奇指标时才计数；
+  奇-奇交换奇数次乘 `-1`，偶数次为 `+1`；偶指标穿插不改变符号。
+- 中间结果始终按整网首次出现顺序规范化，最终输出统一为
+  `ContractionPlan.output_axes`，不把转置视为免费重排。不同括号顺序累计到同一
+  整网规范排列时必须得到相同数值结果和符号。
 
 ### 异常语义（搜索预算耗尽 ≠ 证明无解，严格分开）
 
@@ -88,8 +116,9 @@ from tensor_peak import (
 - 给定 `memory_limit` 时，构建中即剔除任何峰值超限的点。这是**精确剪枝**：
   父集峰值不可能低于已含子集的峰值，因此全集前沿为空等价于穷举性地证明无解；
   这与预算中断完全不同。
-- 轴在中间结果中的排列按“标签在原始输入中的首次出现顺序”规范化，使等价计划
-  的表示唯一、确定。
+- 轴在中间结果中的排列按“标签在原始输入中的首次出现顺序”规范化；奇指标符号
+  通过当前步骤在整网规范轴令牌序列中的对应位置计算，避免只做局部转置而漏掉
+  括号间的结合性符号。
 - 计划重建阶段按 DP 选择的求值顺序线性化，中间量名 `T0,T1,...` 即产生顺序；
   每步的 `residency` 显式列出该瞬间全部驻留对象，使峰值声明可逐步审计。
 - **取舍**：内存单位是“标量元素个数”，不模拟分块、dtype 字节、对齐、
@@ -100,6 +129,9 @@ from tensor_peak import (
 ## 输入上限
 
 - 张量数 1..**10**；每个标签出现 1 或 2 次；维大小为任意正整数（Python 大整数）。
+- 每个指标的奇偶性固定为偶或奇；不支持指标依赖位置/数值改变奇偶，不实现完整
+  费米子物理库、Grassmann 代数对象或反交换数据结构，只在稠密数值收缩时计算
+  必要置换符号。
 - 子集 DP 复杂度约为 O(3^n · F²)（F 为前沿宽度，本类问题通常很小）；n=10
   稠密网络在普通机器上亚秒级完成。
 
@@ -112,13 +144,19 @@ from tensor_peak import (
   权衡（四环实例：168 乘/峰值 66 与 174 乘/峰值 61 互为 Pareto）、预算耗尽
   与证明无解的区分、断网（封堵 `socket.socket`）下完成规划、非法输入、
   n=10 上限规模等。
-- `tests/test_numeric.py`：独立的稠密逐元素执行器按计划逐步收缩，与独立直算
-  枚举求和结果做精确 `==` 比对（往返一致只作补充，期望值不来自被测核心）。
+- `tests/test_numeric.py`：独立的稠密逐元素参考按计划形状枚举求和，做精确
+  `==` 比对（往返一致只作补充，期望值不来自被测核心）。
+- `tests/test_parity.py`：奇指标规划的独立全指标求和和显式规范置换参考，覆盖
+  两种括号顺序、两个奇指标交换、偶指标穿插、迹收缩、输出轴规范化和异常路径。
 
 ## 已知限制
 
 - 不做分块/布局/内核级内存建模，内存只计标量元素驻留。
 - 不支持标签出现 ≥3 次、外积、广播、稀疏张量；非法情形直接报错。
+- 奇偶支持限定为每个指标固定偶/奇的普通有限维稠密小张量；执行器为教学/验证
+  使用嵌套 list，不是优化 BLAS/费米子张量库。
+- 不推导物理张量本身的阶奇偶、位置相关奇偶、算子共轭或完整 Grassmann 约定；
+  调用者必须通过 `parity` 明确给出固定指标奇偶。
 - 前沿可能随极端维大小组合变宽；n≤10 下预算默认关闭即可穷举，必要时可用
   `search_budget` 显式管理（耗尽时得到的是 `BudgetExhaustedError` 而非无解
   结论）。

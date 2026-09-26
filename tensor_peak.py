@@ -9,6 +9,7 @@ DP + (标量乘法数, 峰值驻留) Pareto 前沿，在两两收缩、禁止外
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -26,6 +27,7 @@ __all__ = [
     "DisconnectedNetworkError",
     "MemoryLimitInfeasibleError",
     "BudgetExhaustedError",
+    "execute_plan",
     "find_plan",
     "pareto_front",
     "format_tree",
@@ -80,8 +82,9 @@ class TensorSpec:
     name: str
     axes: tuple[str, ...]
     shape: tuple[int, ...]
+    parity: tuple[bool, ...]
 
-    def __init__(self, name, axes, shape):
+    def __init__(self, name, axes, shape, parity=None):
         if not isinstance(name, str) or not name:
             raise InvalidProblemError(
                 "TensorSpec.name 必须是非空 str，得到 %r" % (name,)
@@ -96,6 +99,14 @@ class TensorSpec:
             )
         axes = tuple(axes)
         shape = tuple(shape)
+        if parity is None:
+            parity = tuple(False for _ in axes)
+        elif isinstance(parity, str) or not isinstance(parity, Sequence):
+            raise InvalidProblemError(
+                "张量 %r 的 parity 必须是布尔序列或 None" % name
+            )
+        else:
+            parity = tuple(parity)
         for p, label in enumerate(axes):
             if not isinstance(label, str) or not label:
                 raise InvalidProblemError(
@@ -111,9 +122,21 @@ class TensorSpec:
                 "张量 %r 的 axes/shape 长度不一致: %d != %d"
                 % (name, len(axes), len(shape))
             )
+        if len(parity) != len(axes):
+            raise InvalidProblemError(
+                "张量 %r 的 parity/axes 长度不一致: %d != %d"
+                % (name, len(parity), len(axes))
+            )
+        for p, flag in enumerate(parity):
+            if not isinstance(flag, bool):
+                raise InvalidProblemError(
+                    "张量 %r 的第 %d 个奇偶标记必须是 bool，得到 %r"
+                    % (name, p, flag)
+                )
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "axes", axes)
         object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "parity", parity)
 
     @property
     def size(self) -> int:
@@ -153,6 +176,12 @@ class ContractStep:
     mult_count: int
     residency: tuple[tuple[str, int], ...]
     peak_at_step: int
+    operation_axes: tuple[str, ...]
+    lhs_permutation: tuple[int, ...]
+    rhs_permutation: tuple[int, ...]
+    output_permutation: tuple[int, ...]
+    odd_swaps: int
+    sign: int
 
 
 @dataclass(frozen=True)
@@ -169,6 +198,8 @@ class ContractionPlan:
     steps: tuple[ContractStep, ...]
     tree: tuple
     tree_text: str
+    axis_parity: dict[str, bool]
+    parity_sign: int
 
 
 @dataclass(frozen=True)
@@ -246,18 +277,25 @@ def _validate(tensors, memory_limit, search_budget):
     # 标签出现次数 1 或 2；同名标签维大小必须一致。
     label_size: dict[str, int] = {}
     label_count: dict[str, int] = {}
+    label_parity: dict[str, bool] = {}
     for t in specs:
-        for label, d in zip(t.axes, t.shape):
+        for label, d, odd in zip(t.axes, t.shape, t.parity):
             if label in label_size:
                 if label_size[label] != d:
                     raise InvalidProblemError(
                         "收缩轴 %r 的维大小冲突: %d != %d（出现于张量 %r）"
                         % (label, label_size[label], d, t.name)
                     )
+                if label_parity[label] != odd:
+                    raise InvalidProblemError(
+                        "指标 %r 的奇偶标记冲突: %r != %r（出现于张量 %r）"
+                        % (label, label_parity[label], odd, t.name)
+                    )
                 label_count[label] += 1
             else:
                 label_size[label] = d
                 label_count[label] = 1
+                label_parity[label] = odd
     bad = [lbl for lbl, c in label_count.items() if c > 2]
     if bad:
         raise InvalidProblemError(
@@ -271,7 +309,14 @@ def _validate(tensors, memory_limit, search_budget):
     budget = _check_positive_int(
         search_budget, "search_budget", allow_none=True
     )
-    return tuple(specs), label_size, label_count, limit, budget
+    return (
+        tuple(specs),
+        label_size,
+        label_count,
+        label_parity,
+        limit,
+        budget,
+    )
 
 
 def _check_connected(specs, label_count) -> None:
@@ -309,6 +354,34 @@ def _check_connected(specs, label_count) -> None:
         raise DisconnectedNetworkError(
             "收缩网络不连通（%s）：禁止外积时不存在两两收缩计划" % detail
         )
+
+
+def _odd_inversions(
+    source_axes: tuple[str, ...],
+    target_axes: tuple[str, ...],
+    axis_parity: dict[str, bool],
+) -> int:
+    """统计 source->target 置换中两端轴都是奇指标的逆序数。"""
+    target_slots: dict[str, list[int]] = {}
+    for pos, label in enumerate(target_axes):
+        target_slots.setdefault(label, []).append(pos)
+    remaining = {label: list(slots) for label, slots in target_slots.items()}
+    positions = []
+    for label in source_axes:
+        slots = remaining.get(label)
+        if not slots:
+            raise TensorPlanningError("内部错误：轴置换缺少目标位置 %r" % label)
+        positions.append(slots.pop(0))
+    if any(slots for slots in remaining.values()):
+        raise TensorPlanningError("内部错误：轴置换未使用全部目标位置")
+    swaps = 0
+    for i, left in enumerate(positions):
+        if not axis_parity[source_axes[i]]:
+            continue
+        for j in range(i + 1, len(positions)):
+            if axis_parity[source_axes[j]] and left > positions[j]:
+                swaps += 1
+    return swaps
 
 
 # ---------------------------------------------------------------------------
@@ -462,14 +535,36 @@ def _solve(specs, label_size, label_count, limit, budget):
 # ---------------------------------------------------------------------------
 
 
-def _build_plan(specs, label_size, limit, entry, labels_order):
+def _build_plan(
+    specs,
+    label_size,
+    label_parity,
+    label_count,
+    limit,
+    entry,
+    labels_order,
+):
     by_name = {t.name: t for t in specs}
+    index_by_name = {t.name: i for i, t in enumerate(specs)}
+    owners_by_axis = {}
+    for axis in labels_order:
+        owners_by_axis[axis] = tuple(
+            i for i, tensor in enumerate(specs) if axis in tensor.axes
+        )
     steps: list[ContractStep] = []
     counter = [0]
 
     def ref_input(name):
         t = by_name[name]
         return OperandRef("input", name, t.axes, t.shape, t.size, None)
+
+    def leaf_indices(tree):
+        if tree[0] == "leaf":
+            return {index_by_name[tree[1]]}
+        result = set()
+        result.update(leaf_indices(tree[2]))
+        result.update(leaf_indices(tree[3]))
+        return result
 
     def emit(tree, held: tuple[tuple[str, int], ...]):
         """求值 tree；held 为求值期间始终驻留的（中间量名, 大小）。"""
@@ -490,6 +585,64 @@ def _build_plan(specs, label_size, limit, entry, labels_order):
             lhs, rhs = op_first, op_second
         else:
             lhs, rhs = op_second, op_first
+        node_leaves = leaf_indices(tree)
+        node_axis_set = set(out_axes) | set(contracted)
+        canonical_tokens = tuple(
+            (axis, owner)
+            for axis in labels_order
+            if label_count[axis] == 1
+            for owner in owners_by_axis[axis]
+        ) + tuple(
+            (axis, owner)
+            for axis in labels_order
+            if label_count[axis] == 2
+            for owner in owners_by_axis[axis]
+        )
+        selected_tokens = tuple(
+            (axis, owner)
+            for axis, owner in canonical_tokens
+            if owner in node_leaves and axis in node_axis_set
+        )
+        operation_axes = tuple(axis for axis, _owner in selected_tokens)
+        target_slots: dict[str, list[int]] = {}
+        slot_owner: dict[str, dict[int, int]] = {}
+        for position, (axis, _owner) in enumerate(selected_tokens):
+            target_slots.setdefault(axis, []).append(position)
+            slot_owner.setdefault(axis, {})[_owner] = position
+
+        def operand_positions(operand, child_tree):
+            child_leaves = leaf_indices(child_tree)
+            positions = []
+            for axis in operand.axes:
+                owners = [
+                    owner for owner in owners_by_axis[axis]
+                    if owner in child_leaves
+                ]
+                if len(owners) != 1:
+                    raise TensorPlanningError(
+                        "内部错误：操作数 %r 中轴 %r 的来源不唯一"
+                        % (operand.name, axis)
+                    )
+                owner = owners[0]
+                positions.append(slot_owner[axis][owner])
+            return tuple(positions)
+
+        lhs_positions = operand_positions(lhs, tl)
+        rhs_positions = operand_positions(rhs, tr)
+        lhs_permutation = tuple(
+            index
+            for _, index in sorted(zip(lhs_positions, range(len(lhs.axes))))
+        )
+        rhs_permutation = tuple(
+            index
+            for _, index in sorted(zip(rhs_positions, range(len(rhs.axes))))
+        )
+        source_axes = lhs.axes + rhs.axes
+        odd_swaps = _odd_inversions(
+            source_axes, operation_axes, label_parity
+        )
+        sign = -1 if odd_swaps % 2 else 1
+        output_permutation = tuple(range(len(out_axes)))
         idx = counter[0]
         counter[0] += 1
         out_shape = tuple(label_size[a] for a in out_axes)
@@ -513,6 +666,12 @@ def _build_plan(specs, label_size, limit, entry, labels_order):
             output_axes=out_axes,
             output_shape=out_shape,
             mult_count=node_muls,
+            operation_axes=operation_axes,
+            lhs_permutation=lhs_permutation,
+            rhs_permutation=rhs_permutation,
+            output_permutation=output_permutation,
+            odd_swaps=odd_swaps,
+            sign=sign,
             residency=residency,
             peak_at_step=sum(sz for _, sz in residency),
         )
@@ -545,12 +704,14 @@ def _build_plan(specs, label_size, limit, entry, labels_order):
         peak_memory=peak,
         peak_step=peak_step,
         steps=tuple(steps),
+        axis_parity=dict(label_parity),
+        parity_sign=math.prod((step.sign for step in steps), start=1),
         tree=entry.tree,
         tree_text=format_tree(entry.tree),
     )
 
 
-def _build_trivial_plan(specs, label_size, limit, labels_order):
+def _build_trivial_plan(specs, label_size, label_parity, limit, labels_order):
     t = specs[0]
     output_axes = tuple(
         lbl for lbl in labels_order if sum(lbl in x.axes for x in specs) == 1
@@ -564,6 +725,8 @@ def _build_trivial_plan(specs, label_size, limit, labels_order):
         peak_memory=0,
         peak_step=None,
         steps=(),
+        axis_parity=dict(label_parity),
+        parity_sign=1,
         tree=("leaf", t.name),
         tree_text=format_tree(("leaf", t.name)),
     )
@@ -591,7 +754,7 @@ def find_plan(tensors, memory_limit: int, *, search_budget: Optional[int] = None
         MemoryLimitInfeasibleError: 完整穷举后证明无满足上限的计划。
         BudgetExhaustedError: 预算耗尽，尚未证明无解。
     """
-    specs, label_size, label_count, limit, budget = _validate(
+    specs, label_size, label_count, label_parity, limit, budget = _validate(
         tensors, memory_limit, search_budget
     )
     labels_order: list[str] = []
@@ -600,12 +763,22 @@ def find_plan(tensors, memory_limit: int, *, search_budget: Optional[int] = None
             if lbl not in labels_order:
                 labels_order.append(lbl)
     if len(specs) == 1:
-        return _build_trivial_plan(specs, label_size, limit, labels_order)
+        return _build_trivial_plan(
+            specs, label_size, label_parity, limit, labels_order
+        )
     _check_connected(specs, label_count)
     entry, _fronts, _ax, _sz, _lo = _solve(
         specs, label_size, label_count, limit, budget
     )
-    plan = _build_plan(specs, label_size, limit, entry, labels_order)
+    plan = _build_plan(
+        specs,
+        label_size,
+        label_parity,
+        label_count,
+        limit,
+        entry,
+        labels_order,
+    )
     # 内部不变量：DP 中已按 limit 精确剪枝，重建出的计划不可能超限。
     if plan.peak_memory > limit:
         raise TensorPlanningError(
@@ -621,7 +794,7 @@ def pareto_front(tensors, *, search_budget: Optional[int] = None):
     用于观察成本/内存权衡：前沿上没有点在两个目标上同时更优。
     异常语义同 find_plan（无 memory_limit 相关拒绝）。
     """
-    specs, label_size, label_count, _limit, budget = _validate(
+    specs, label_size, label_count, label_parity, _limit, budget = _validate(
         tensors, 10**30, search_budget
     )
     labels_order: list[str] = []
@@ -640,6 +813,139 @@ def pareto_front(tensors, *, search_budget: Optional[int] = None):
         FrontPoint(e.muls, e.peak, e.tree)
         for e in sorted(fronts[full], key=lambda e: (e.muls, e.peak))
     )
+
+
+def _nested_get(array, index):
+    value = array
+    for position in index:
+        value = value[position]
+    return value
+
+
+def _transpose_dense(array, shape, permutation):
+    """返回嵌套 list；输出第 k 轴来自输入 permutation[k]。"""
+    if len(shape) == 0:
+        return array
+    output_shape = tuple(shape[position] for position in permutation)
+    inverse = [0] * len(permutation)
+    for output_position, input_position in enumerate(permutation):
+        inverse[input_position] = output_position
+
+    def zeros(axis):
+        if axis == len(output_shape) - 1:
+            return [0] * output_shape[axis]
+        return [zeros(axis + 1) for _ in range(output_shape[axis])]
+
+    result = zeros(0)
+    for output_index in itertools.product(
+        *(range(dimension) for dimension in output_shape)
+    ):
+        source_index = tuple(output_index[inverse[axis]] for axis in range(len(shape)))
+        target = result
+        for position in output_index[:-1]:
+            target = target[position]
+        target[output_index[-1]] = _nested_get(array, source_index)
+    return result
+
+
+def _make_demo_inputs(plan):
+    arrays = {}
+    for tensor in plan.tensors:
+        def build(axis):
+            if axis == len(tensor.shape):
+                return 1
+            return [build(axis + 1) for _ in range(tensor.shape[axis])]
+
+        array = build(0)
+        for index in itertools.product(
+            *(range(dimension) for dimension in tensor.shape)
+        ):
+            target = array
+            for position in index[:-1]:
+                target = target[position]
+            base = sum(ord(char) for char in tensor.name) % 7 + 1
+            target[index[-1]] = base + sum(
+                (position + 1) * (value + 1)
+                for position, value in enumerate(index)
+            )
+        arrays[tensor.name] = array
+    return arrays
+
+
+def execute_plan(plan, inputs=None):
+    """用普通嵌套 list 执行计划，并显式应用计划记录的奇指标置换符号。
+
+    inputs 为 {TensorSpec.name: 嵌套序列}；省略时生成确定性整数小张量。
+    返回按 plan.output_axes 排列的嵌套 list；标量结果直接返回数值。
+    """
+    if inputs is None:
+        inputs = _make_demo_inputs(plan)
+    if not isinstance(inputs, dict):
+        raise TypeError("inputs 必须是 {张量名: 嵌套序列} 字典")
+
+    live = {}
+    available = {tensor.name: tensor for tensor in plan.tensors}
+
+    def operand_view(name):
+        if name in available:
+            tensor = available[name]
+            return tensor.axes, tensor.shape, inputs[name]
+        return live[name]
+
+    for step in plan.steps:
+        axes_l, shape_l, array_l = operand_view(step.lhs.name)
+        axes_r, shape_r, array_r = operand_view(step.rhs.name)
+        array_l = _transpose_dense(array_l, shape_l, step.lhs_permutation)
+        array_r = _transpose_dense(array_r, shape_r, step.rhs_permutation)
+        axes_l = tuple(axes_l[position] for position in step.lhs_permutation)
+        axes_r = tuple(axes_r[position] for position in step.rhs_permutation)
+
+        operation_axes = step.operation_axes
+        unique_axes = []
+        for axis in operation_axes:
+            if axis not in unique_axes:
+                unique_axes.append(axis)
+        dimensions = {}
+        dimensions.update(dict(zip(step.lhs.axes, step.lhs.shape)))
+        dimensions.update(dict(zip(step.rhs.axes, step.rhs.shape)))
+        output = {}
+        for operation_index in itertools.product(
+            *(range(dimensions[axis]) for axis in unique_axes)
+        ):
+            positions = dict(zip(unique_axes, operation_index))
+            index_l = tuple(positions[axis] for axis in axes_l)
+            index_r = tuple(positions[axis] for axis in axes_r)
+            output_index = tuple(positions[axis] for axis in step.output_axes)
+            value = step.sign * _nested_get(array_l, index_l) * _nested_get(
+                array_r, index_r
+            )
+            output[output_index] = output.get(output_index, 0) + value
+
+        if not step.output_shape:
+            result = output[()]
+        else:
+            def zeros(axis):
+                if axis == len(step.output_shape) - 1:
+                    return [0] * step.output_shape[axis]
+                return [zeros(axis + 1) for _ in range(step.output_shape[axis])]
+
+            result = zeros(0)
+            for index, value in output.items():
+                target = result
+                for position in index[:-1]:
+                    target = target[position]
+                target[index[-1]] = value
+        live[step.output_name] = (step.output_axes, step.output_shape, result)
+        for operand in (step.lhs, step.rhs):
+            if operand.kind == "intermediate":
+                live.pop(operand.name, None)
+
+    if not plan.steps:
+        tensor = plan.tensors[0]
+        return _transpose_dense(
+            inputs[tensor.name], tensor.shape, tuple(range(len(tensor.axes)))
+        )
+    return live[plan.steps[-1].output_name][2]
 
 
 def format_tree(tree) -> str:
