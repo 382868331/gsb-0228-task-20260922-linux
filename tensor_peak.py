@@ -4,12 +4,13 @@
 DP + (标量乘法数, 峰值驻留) Pareto 前沿，在两两收缩、禁止外积的前提下，
 求满足内存上限的最少标量乘法收缩计划，并输出括号树、逐步形状与峰值证据。
 
-本模块只使用 Python 标准库，全部计算为精确整数运算，不涉及浮点误差。
+旧接口只做精确整数内存/成本计算；新接口用 Decimal 传播保守浮点误差界。
 """
 
 from __future__ import annotations
 
 import math
+from decimal import Decimal, InvalidOperation, getcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -26,7 +27,13 @@ __all__ = [
     "DisconnectedNetworkError",
     "MemoryLimitInfeasibleError",
     "BudgetExhaustedError",
+    "PrecisionSpec",
+    "PrecisionContractStep",
+    "PrecisionPlan",
+    "ConstraintsInfeasibleError",
+    "DEFAULT_PRECISION_LEVELS",
     "find_plan",
+    "find_precision_plan",
     "pareto_front",
     "format_tree",
 ]
@@ -61,6 +68,10 @@ class MemoryLimitInfeasibleError(InfeasibleError):
 
 class BudgetExhaustedError(TensorPlanningError):
     """搜索预算耗尽，搜索停止；此时尚未证明无解，须与 InfeasibleError 区分。"""
+
+
+class ConstraintsInfeasibleError(InfeasibleError):
+    """已穷举顺序与精度组合，证明内存或最终误差约束无解。"""
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +191,61 @@ class FrontPoint:
     tree: tuple
 
 
+@dataclass(frozen=True)
+class PrecisionSpec:
+    """一档模拟浮点精度及其每个标量乘法的抽象成本。"""
+
+    name: str
+    unit_roundoff: Decimal
+    cost_per_mult: int
+
+    def __init__(self, name, unit_roundoff, cost_per_mult):
+        if not isinstance(name, str) or not name:
+            raise InvalidProblemError("精度名称必须是非空 str")
+        u = _decimal_number(unit_roundoff, "精度 %s 的 unit_roundoff" % name)
+        if not (Decimal(0) < u < Decimal(1)):
+            raise InvalidProblemError(
+                "精度 %s 的 unit_roundoff 必须位于 (0,1)，得到 %s"
+                % (name, u)
+            )
+        if isinstance(cost_per_mult, bool) or not isinstance(cost_per_mult, int):
+            raise InvalidProblemError("精度成本必须是正整数")
+        if cost_per_mult < 1:
+            raise InvalidProblemError("精度成本必须 >= 1")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "unit_roundoff", u)
+        object.__setattr__(self, "cost_per_mult", cost_per_mult)
+
+
+@dataclass(frozen=True)
+class PrecisionContractStep(ContractStep):
+    """带精度与误差账本的一次收缩。"""
+
+    precision: PrecisionSpec
+    contraction_length: int
+    gamma_n: Decimal
+    lhs_magnitude: Decimal
+    rhs_magnitude: Decimal
+    nominal_magnitude: Decimal
+    input_error_bound: Decimal
+    rounding_error_bound: Decimal
+    output_error_bound: Decimal
+    output_magnitude_bound: Decimal
+    step_cost: int
+
+
+@dataclass(frozen=True)
+class PrecisionPlan(ContractionPlan):
+    """同时选择括号顺序、求值顺序和逐步精度的完整计划。"""
+
+    total_cost: int = 0
+    error_limit: Optional[Decimal] = None
+    final_error_bound: Optional[Decimal] = None
+    value_bounds: Optional[dict[str, Decimal]] = None
+    input_error_bounds: Optional[dict[str, Decimal]] = None
+    precision_levels: tuple[PrecisionSpec, ...] = ()
+
+
 # ---------------------------------------------------------------------------
 # 输入校验
 # ---------------------------------------------------------------------------
@@ -212,6 +278,92 @@ def _check_positive_int(value, what: str, *, allow_none: bool = False):
     if value < 1:
         raise InvalidProblemError("%s 必须 >= 1，得到 %d" % (what, value))
     return value
+
+
+def _decimal_number(value, what: str) -> Decimal:
+    if isinstance(value, bool):
+        raise InvalidProblemError("%s 不得为 bool" % what)
+    if not isinstance(value, (int, Decimal, str)):
+        raise InvalidProblemError("%s 必须是精确数字或 Decimal 字符串" % what)
+    try:
+        result = Decimal(value)
+    except (InvalidOperation, ValueError):
+        raise InvalidProblemError("%s 不是有效 Decimal 数字" % what)
+    if not result.is_finite():
+        raise InvalidProblemError("%s 必须有限，得到 %s" % (what, result))
+    return result
+
+
+def _nonnegative_decimal(value, what: str) -> Decimal:
+    result = _decimal_number(value, what)
+    if result < 0:
+        raise InvalidProblemError("%s 必须 >= 0，得到 %s" % (what, result))
+    return result
+
+
+def _positive_decimal(value, what: str) -> Decimal:
+    result = _decimal_number(value, what)
+    if result <= 0:
+        raise InvalidProblemError("%s 必须 > 0，得到 %s" % (what, result))
+    return result
+
+
+DEFAULT_PRECISION_LEVELS = (
+    PrecisionSpec("low", Decimal(1) / Decimal(1000), 1),
+    PrecisionSpec("high", Decimal(1) / Decimal(1_000_000), 8),
+)
+
+
+def _validate_precision_args(
+    specs,
+    memory_limit,
+    error_limit,
+    value_bounds,
+    input_error_bounds,
+    precision_levels,
+    search_budget,
+):
+    validated, label_size, label_count, limit, budget = _validate(
+        specs, memory_limit, search_budget
+    )
+    err_limit = _positive_decimal(error_limit, "error_limit")
+    if not isinstance(value_bounds, dict):
+        raise InvalidProblemError("value_bounds 必须是 dict[str, 数值]")
+    names = {t.name for t in validated}
+    if set(value_bounds) != names:
+        raise InvalidProblemError(
+            "value_bounds 必须恰好给出每个输入的元素绝对值上界"
+        )
+    bounds = {
+        name: _nonnegative_decimal(
+            value_bounds[name], "输入 %r 的 value_bound" % name
+        )
+        for name in value_bounds
+    }
+    zero_bounds = {name: Decimal(0) for name in names}
+    errors = dict(zero_bounds)
+    if input_error_bounds is not None:
+        if not isinstance(input_error_bounds, dict):
+            raise InvalidProblemError("input_error_bounds 必须是 dict")
+        bad = set(input_error_bounds) - names
+        if bad:
+            raise InvalidProblemError("input_error_bounds 含未知输入 %r" % sorted(bad))
+        for name, value in input_error_bounds.items():
+            errors[name] = _nonnegative_decimal(
+                value, "输入 %r 的已有误差界" % name
+            )
+
+    levels = tuple(precision_levels or DEFAULT_PRECISION_LEVELS)
+    if isinstance(levels, (str, bytes)) or not isinstance(levels, Sequence):
+        raise InvalidProblemError("precision_levels 必须是 PrecisionSpec 序列")
+    if len(levels) != 2 or any(not isinstance(p, PrecisionSpec) for p in levels):
+        raise InvalidProblemError("precision_levels 必须恰好包含两档 PrecisionSpec")
+    if len({p.name for p in levels}) != 2:
+        raise InvalidProblemError("两档精度名称必须不同")
+    return (
+        validated, label_size, label_count, limit, err_limit,
+        bounds, errors, tuple(levels), budget,
+    )
 
 
 def _validate(tensors, memory_limit, search_budget):
@@ -457,6 +609,231 @@ def _solve(specs, label_size, label_count, limit, budget):
     return best, fronts, axes_of, size_of, labels_order
 
 
+@dataclass(frozen=True)
+class _PrecisionEntry:
+    cost: int
+    peak: int
+    nominal: Decimal
+    error: Decimal
+    tree: tuple
+    order: int
+
+
+def _prune_precision(entries, limit):
+    ordered = sorted(
+        entries,
+        key=lambda e: (e.cost, e.peak, e.error),
+    )
+    kept = []
+    for candidate in ordered:
+        if candidate.peak > limit:
+            continue
+        dominated = False
+        for prior in kept:
+            if (
+                prior.cost <= candidate.cost
+                and prior.peak <= candidate.peak
+                and prior.error <= candidate.error
+            ):
+                dominated = True
+                break
+        if not dominated:
+            kept = [
+                p for p in kept
+                if not (
+                    candidate.cost <= p.cost
+                    and candidate.peak <= p.peak
+                    and candidate.error <= p.error
+                )
+            ]
+            kept.append(candidate)
+    return kept
+
+
+def _axis_tables(specs, label_size):
+    n = len(specs)
+    N = 1 << n
+    labels_order = []
+    for t in specs:
+        for label in t.axes:
+            if label not in labels_order:
+                labels_order.append(label)
+    index_of = {label: i for i, label in enumerate(labels_order)}
+    axes_of = [None] * N
+    size_of = [0] * N
+    for mask in range(1, N):
+        counts = [0] * len(labels_order)
+        members = mask
+        while members:
+            bit = members & -members
+            i = bit.bit_length() - 1
+            for label in specs[i].axes:
+                counts[index_of[label]] += 1
+            members ^= bit
+        axes = tuple(
+            label
+            for label, count in zip(labels_order, counts)
+            if count == 1
+        )
+        axes_of[mask] = axes
+        size_of[mask] = math.prod(label_size[label] for label in axes)
+    return labels_order, axes_of, size_of
+
+
+def _solve_precision(
+    specs,
+    label_size,
+    limit,
+    error_limit,
+    value_bounds,
+    input_errors,
+    levels,
+    budget,
+):
+    getcontext().prec = 80
+    n = len(specs)
+    N = 1 << n
+    labels_order, axes_of, size_of = _axis_tables(specs, label_size)
+    remaining = budget
+    fronts = {}
+    for i, t in enumerate(specs):
+        mask = 1 << i
+        leaf = ("leaf", t.name)
+        fronts[mask] = [
+            _PrecisionEntry(
+                0,
+                0,
+                value_bounds[t.name],
+                input_errors[t.name],
+                leaf,
+                0,
+            )
+        ]
+
+    for mask in range(1, N):
+        if mask & (mask - 1) == 0:
+            continue
+        low = mask & -mask
+        sub = (mask - 1) & mask
+        collected = []
+        while sub:
+            other = mask ^ sub
+            if sub & low:
+                left_axes = axes_of[sub]
+                right_axes = axes_of[other]
+                shared = set(left_axes) & set(right_axes)
+                if shared and fronts.get(sub) and fronts.get(other):
+                    union = set(left_axes) | set(right_axes)
+                    out_axes = tuple(
+                        a for a in labels_order if a in union and a not in shared
+                    )
+                    contracted = tuple(a for a in labels_order if a in shared)
+                    contraction_length = math.prod(label_size[a] for a in shared)
+                    node_muls = math.prod(label_size[a] for a in union)
+                    left_size = size_of[sub]
+                    right_size = size_of[other]
+                    out_size = size_of[mask]
+                    triple = left_size + right_size + out_size
+
+                    for left in fronts[sub]:
+                        for right in fronts[other]:
+                            for precision in levels:
+                                if remaining is not None:
+                                    if remaining == 0:
+                                        raise BudgetExhaustedError(
+                                            "搜索预算（顺序×精度候选求值次数）耗尽，"
+                                            "搜索停止；未证明无解，请增大 search_budget"
+                                        )
+                                    remaining -= 1
+
+                                k_dec = Decimal(contraction_length)
+                                ku = k_dec * precision.unit_roundoff
+                                if ku >= 1:
+                                    continue
+                                gamma = ku / (Decimal(1) - ku)
+                                a = left.nominal
+                                b = right.nominal
+                                ea = left.error
+                                eb = right.error
+                                nominal = k_dec * a * b
+                                existing_error = k_dec * (a * eb + b * ea + ea * eb)
+                                rounded_operand_sum = (a + ea) * (b + eb)
+                                rounding_error = (
+                                    gamma
+                                    * rounded_operand_sum
+                                    * (Decimal(1) + Decimal("1e-60"))
+                                )
+                                error = existing_error + rounding_error
+                                if error > error_limit:
+                                    continue
+
+                                peak_left_first = max(
+                                    left.peak,
+                                    left_size + right.peak,
+                                    triple,
+                                )
+                                peak_right_first = max(
+                                    right.peak,
+                                    right_size + left.peak,
+                                    triple,
+                                )
+                                if peak_left_first <= peak_right_first:
+                                    peak, order = peak_left_first, 0
+                                else:
+                                    peak, order = peak_right_first, 1
+
+                                ledger = {
+                                    "precision": precision,
+                                    "contraction_length": contraction_length,
+                                    "gamma_n": gamma,
+                                    "lhs_magnitude": a,
+                                    "rhs_magnitude": b,
+                                    "nominal_magnitude": nominal,
+                                    "input_error_bound": existing_error,
+                                    "rounding_error_bound": rounding_error,
+                                    "output_error_bound": error,
+                                    "output_magnitude_bound": nominal + error,
+                                    "step_cost": node_muls * precision.cost_per_mult,
+                                }
+                                tree = (
+                                    "pnode",
+                                    out_axes,
+                                    left.tree,
+                                    right.tree,
+                                    contracted,
+                                    node_muls,
+                                    order,
+                                    precision,
+                                    nominal,
+                                    error,
+                                    ledger,
+                                )
+                                collected.append(
+                                    _PrecisionEntry(
+                                        left.cost
+                                        + right.cost
+                                        + node_muls * precision.cost_per_mult,
+                                        peak,
+                                        nominal,
+                                        error,
+                                        tree,
+                                        order,
+                                    )
+                                )
+            sub = (sub - 1) & mask
+        front = _prune_precision(collected, limit)
+        if front:
+            fronts[mask] = front
+
+    front = fronts.get(N - 1)
+    if not front:
+        raise ConstraintsInfeasibleError(
+            "已穷举全部合法顺序和两档精度组合：不存在峰值 <= %d 且最终绝对误差 <= %s 的计划"
+            % (limit, format(error_limit, "f"))
+        )
+    return min(front, key=lambda e: (e.cost, e.peak, e.error)), labels_order
+
+
 # ---------------------------------------------------------------------------
 # 计划重建（线性化 + 峰值证据）
 # ---------------------------------------------------------------------------
@@ -569,6 +946,137 @@ def _build_trivial_plan(specs, label_size, limit, labels_order):
     )
 
 
+def _build_precision_plan(
+    specs,
+    label_size,
+    limit,
+    error_limit,
+    value_bounds,
+    input_errors,
+    levels,
+    entry,
+    labels_order,
+):
+    by_name = {t.name: t for t in specs}
+    steps = []
+    counter = [0]
+
+    def ref_input(name):
+        tensor = by_name[name]
+        return (
+            OperandRef("input", name, tensor.axes, tensor.shape, tensor.size, None),
+            value_bounds[name],
+            input_errors[name],
+        )
+
+    def emit(tree, held):
+        kind = tree[0]
+        if kind == "leaf":
+            return ref_input(tree[1])
+        (
+            _kind,
+            out_axes,
+            tree_left,
+            tree_right,
+            contracted,
+            node_muls,
+            order,
+            precision,
+            _nominal,
+            _error,
+            ledger,
+        ) = tree
+        if order == 0:
+            left_ref, left_nominal, left_error = emit(tree_left, held)
+            held_left = held
+            if left_ref.kind == "intermediate":
+                held_left = held + ((left_ref.name, left_ref.size),)
+            right_ref, right_nominal, right_error = emit(tree_right, held_left)
+            first_side = "lhs"
+        else:
+            right_ref, right_nominal, right_error = emit(tree_right, held)
+            held_right = held
+            if right_ref.kind == "intermediate":
+                held_right = held + ((right_ref.name, right_ref.size),)
+            left_ref, left_nominal, left_error = emit(tree_left, held_right)
+            first_side = "rhs"
+
+        idx = counter[0]
+        counter[0] += 1
+        out_shape = tuple(label_size[a] for a in out_axes)
+        out_size = math.prod(out_shape)
+        out_name = "T%d" % idx
+        out_ref = OperandRef(
+            "intermediate", out_name, out_axes, out_shape, out_size, idx
+        )
+        residency = held + (
+            (left_ref.name, left_ref.size),
+            (right_ref.name, right_ref.size),
+            (out_name, out_size),
+        )
+        step = PrecisionContractStep(
+            index=idx,
+            output_name=out_name,
+            lhs=left_ref,
+            rhs=right_ref,
+            evaluated_first=first_side,
+            contracted_axes=tuple(contracted),
+            output_axes=out_axes,
+            output_shape=out_shape,
+            mult_count=node_muls,
+            residency=residency,
+            peak_at_step=sum(size for _, size in residency),
+            precision=precision,
+            contraction_length=ledger["contraction_length"],
+            gamma_n=ledger["gamma_n"],
+            lhs_magnitude=left_nominal,
+            rhs_magnitude=right_nominal,
+            nominal_magnitude=ledger["nominal_magnitude"],
+            input_error_bound=ledger["input_error_bound"],
+            rounding_error_bound=ledger["rounding_error_bound"],
+            output_error_bound=ledger["output_error_bound"],
+            output_magnitude_bound=ledger["output_magnitude_bound"],
+            step_cost=ledger["step_cost"],
+        )
+        steps.append(step)
+        return (
+            out_ref,
+            ledger["nominal_magnitude"],
+            ledger["output_error_bound"],
+        )
+
+    emit(entry.tree, ())
+    peak = max((s.peak_at_step for s in steps), default=0)
+    peak_step = None
+    for step in steps:
+        if step.peak_at_step == peak:
+            peak_step = step.index
+            break
+    output_axes = tuple(
+        label for label in labels_order
+        if sum(label in tensor.axes for tensor in specs) == 1
+    )
+    output_shape = tuple(label_size[a] for a in output_axes)
+    return PrecisionPlan(
+        tensors=tuple(specs),
+        memory_limit=limit,
+        output_axes=output_axes,
+        output_shape=output_shape,
+        total_mult_count=sum(s.mult_count for s in steps),
+        peak_memory=peak,
+        peak_step=peak_step,
+        steps=tuple(steps),
+        tree=entry.tree,
+        tree_text=format_tree(entry.tree),
+        total_cost=entry.cost,
+        error_limit=error_limit,
+        final_error_bound=entry.error,
+        value_bounds=dict(value_bounds),
+        input_error_bounds=dict(input_errors),
+        precision_levels=tuple(levels),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 公开接口
 # ---------------------------------------------------------------------------
@@ -615,6 +1123,98 @@ def find_plan(tensors, memory_limit: int, *, search_budget: Optional[int] = None
     return plan
 
 
+def find_precision_plan(
+    tensors,
+    memory_limit: int,
+    error_limit,
+    value_bounds,
+    *,
+    input_error_bounds=None,
+    precision_levels=DEFAULT_PRECISION_LEVELS,
+    search_budget: Optional[int] = None,
+):
+    """同时选择括号顺序、求值顺序和每步两档精度，最小化精度加权成本。"""
+    (
+        specs,
+        label_size,
+        label_count,
+        limit,
+        err_limit,
+        bounds,
+        input_errors,
+        levels,
+        budget,
+    ) = _validate_precision_args(
+        tensors,
+        memory_limit,
+        error_limit,
+        value_bounds,
+        input_error_bounds,
+        precision_levels,
+        search_budget,
+    )
+    if len(specs) == 1:
+        tensor = specs[0]
+        final_error = input_errors[tensor.name]
+        if final_error > err_limit:
+            raise ConstraintsInfeasibleError(
+                "唯一输入已有误差 %s 超过最终误差上限 %s"
+                % (format(final_error, "f"), format(err_limit, "f"))
+            )
+        labels_order = []
+        for item in specs:
+            for label in item.axes:
+                if label not in labels_order:
+                    labels_order.append(label)
+        return PrecisionPlan(
+            tensors=tuple(specs),
+            memory_limit=limit,
+            output_axes=tuple(
+                label for label in labels_order
+                if sum(label in x.axes for x in specs) == 1
+            ),
+            output_shape=tuple(label_size[a] for a in tensor.axes),
+            total_mult_count=0,
+            peak_memory=0,
+            peak_step=None,
+            steps=(),
+            tree=("leaf", tensor.name),
+            tree_text=format_tree(("leaf", tensor.name)),
+            total_cost=0,
+            error_limit=err_limit,
+            final_error_bound=final_error,
+            value_bounds=dict(bounds),
+            input_error_bounds=dict(input_errors),
+            precision_levels=levels,
+        )
+
+    _check_connected(specs, label_count)
+    entry, labels_order = _solve_precision(
+        specs,
+        label_size,
+        limit,
+        err_limit,
+        bounds,
+        input_errors,
+        levels,
+        budget,
+    )
+    plan = _build_precision_plan(
+        specs,
+        label_size,
+        limit,
+        err_limit,
+        bounds,
+        input_errors,
+        levels,
+        entry,
+        labels_order,
+    )
+    if plan.peak_memory > limit or plan.final_error_bound > err_limit:
+        raise TensorPlanningError("内部不变量被破坏：重建计划不满足约束")
+    return plan
+
+
 def pareto_front(tensors, *, search_budget: Optional[int] = None):
     """返回无内存限制下的 (乘法数, 峰值) Pareto 前沿，按乘法数升序。
 
@@ -647,6 +1247,14 @@ def format_tree(tree) -> str:
     kind = tree[0]
     if kind == "leaf":
         return tree[1]
+    if tree[0] == "pnode":
+        _, out_axes, tl, tr, _contracted, _muls, _order, precision, *_ = tree
+        return "(%s x %s:%s)->[%s]" % (
+            format_tree(tl),
+            format_tree(tr),
+            precision.name,
+            ",".join(out_axes) if out_axes else "scalar",
+        )
     _, out_axes, tl, tr, _contracted, _muls, _order = tree
     return "(%s x %s)->[%s]" % (
         format_tree(tl),
